@@ -1,8 +1,8 @@
 # ESP32-S3 build and rollback plan
 
-Status: Checkpoint 0 draft. No command in this document was used to flash a
-device. Flashing is a separately reviewed, human-run gate on a suitable host,
-not from WSL2.
+Status: Checkpoint 1 host evidence. No command in this document was used to
+flash or access a device. Flashing remains a separately reviewed, human-run
+gate on a suitable host, never from WSL2.
 
 ## Exact rollback asset
 
@@ -36,33 +36,83 @@ that this is the intended restore asset is still pending. The backup does not
 capture eFuses; secure-boot/flash-encryption eFuse state was not recorded and
 must be checked read-only before any human-run write.
 
-## Build gate
+## Host build environment
 
-The required toolchain is ESP-IDF 6.0.1 with the project's pinned micro-ROS
-dependencies. In Ubuntu 22.04 WSL2, `idf.py` is not on `PATH` and no ESP-IDF
-export script was found in the checked standard locations under `/opt/esp` or
-`/home/karsha-lab/esp*`. Therefore the ESP-IDF 6.0.1 dependency is currently
-**MISSING** and no firmware build has been attempted.
+The Ubuntu 22.04 WSL2 environment contains:
 
-After Checkpoint 0 review and installation of the exact dependency, use a clean
-build directory and record:
+- ESP-IDF `v6.0.1`, commit
+  `8c19b156084a0753687347cca1f5355782893533`
+- `xtensa-esp-elf-gcc` 15.2.0
+  (`esp-15.2.0_20251204`)
+- host GCC 11.4.0
+- Python 3.10.12
+- `catkin-pkg` 1.1.1, `colcon-core` 0.21.3, `empy` 3.3.4,
+  and `lark` 1.3.1 in the ESP-IDF virtual environment
+- BNO08x gitlink `fdb99db225fc28f17de0d430a486c182aef927a2`
+- pinned micro-ROS revisions listed in `DEPENDENCY_LOCK.md`
 
-1. `idf.py --version`, compiler versions, Python version, and micro-ROS revision.
-2. Base/source/config/interface SHAs and a clean configure/build command.
-3. All warnings, application binary size, partition fit, image metadata, and
-   application SHA-256.
-4. A reproducible ROS field-order/typesupport check so stale generated types do
-   not conceal an ABI mismatch.
+The phase snapshot had the BNO08x gitlink but omitted `.gitmodules`. The exact
+gitlink was restored for the build, and commit `2f63939d7e71fdfd2e61285f935b9feb7646b40b`
+adds the missing submodule URL for reproducible checkouts. The micro-ROS recipe
+previously cloned moving branch heads; commit
+`8b6d5997f5182b5d78ff7054c45da0ade5c3846f` now detaches every used dependency
+at the tested revision and rejects unreviewed EmbeddedRTPS selection.
 
-A successful compile is host evidence only. It does not validate braking,
-steering, movement, or any physical stop path.
+## Build attempt and result
+
+Tested compiled inputs: commit
+`8b6d5997f5182b5d78ff7054c45da0ade5c3846f`. The later `.gitmodules` commit is
+metadata-only and does not alter any compiled file.
+
+The generated build directory and micro-ROS output trees were removed, then the
+following build was run:
+
+```bash
+source /home/karsha-lab/esp/esp-idf-v6.0.1/export.sh
+cd /home/karsha-lab/laksa-work-in-phases/firmware/esp32-s3
+make -C components/micro_ros_espidf_component -f libmicroros.mk clean
+idf.py build
+```
+
+The clean build cloned and detached the pinned dependencies, built 62 host
+development packages, generated/built 37 embedded micro-ROS packages including
+`laksa_interfaces`, and reached ESP-IDF step 1483/1491. It then failed exactly
+at the intentional guard in `src/actuator_release_config.h`:
+
+```text
+#error "NON-RELEASABLE: review brake action/current, forward/reverse limits,
+conversion, and steering endpoints"
+```
+
+Exit status was 1. No application image was linked or produced, so binary size,
+partition fit, ESP image metadata, and application SHA-256 are unavailable.
+Candidate image SHA-256: `NONE`.
+
+Warnings before the guard were from ESP-IDF Kconfig, setuptools/ament, and
+micro-ROS compilation (notably GCC `#include_next` pedantic warnings and some
+upstream unused variables). One upstream recipe `touch` for an absent optional
+`rcl_logging_log4cxx` directory also warned but did not stop package generation.
+These warnings are preserved in `/tmp/laksa-esp32-clean-build-8b6d599.log` on
+the WSL host; `/tmp` is transient and is not treated as repository evidence.
+
+This build outcome is intentional: unresolved actuator values cannot silently
+become a flashable candidate. A successful future compile is still host
+evidence only and will not validate braking, steering, movement, or any
+physical stop path.
+
+## Reproducible interface checks
+
+`check_ros_interface_layout.py` verifies exact field order before a build.
+The source interface SHA-256 values are recorded in `DEPENDENCY_LOCK.md`.
+The clean build regenerated the corresponding micro-ROS typesupport rather than
+reusing a stale generated tree.
 
 ## Human-run app-only flash procedure (draft; do not execute here)
 
 Prerequisites: explicit pre-flash approval, correct physical board/port,
 traction battery unplugged, verified full backup above available on the flashing
-host, eFuse/security state understood, and a candidate produced from the exact
-reviewed SHA.
+host, eFuse/security state understood, P3 findings resolved, reviewed actuator
+configuration, and a candidate produced from the exact reviewed SHA.
 
 1. Confirm the candidate is an ESP32-S3 application image with
    `esptool.py --chip esp32s3 image_info <candidate.bin>`.
