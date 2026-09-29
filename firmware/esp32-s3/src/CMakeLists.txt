@@ -1,4 +1,5 @@
 set(laksa_sources
+    "actuator_policy.c"
     "steering_control.c"
     "vesc_uart.cpp"
     "pca9685_i2c.c"

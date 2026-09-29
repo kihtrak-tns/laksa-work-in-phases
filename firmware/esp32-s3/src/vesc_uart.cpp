@@ -6,6 +6,7 @@
 #include <new>
 #include <string.h>
 
+#include "actuator_release_config.h"
 #include "esp32_config.h"
 #include "esp_log.h"
 
@@ -40,6 +41,9 @@ static void store_telemetry(vesc_uart_t *vesc, const VescUart &driver)
     vesc->fault_code = (uint8_t)driver.data.error;
     vesc->last_telemetry_tick = xTaskGetTickCount();
     vesc->has_received_telemetry = true;
+    if (++vesc->telemetry_sequence == 0) {
+        ++vesc->telemetry_sequence;
+    }
     xSemaphoreGive(vesc->lock);
 }
 
@@ -56,11 +60,23 @@ static void vesc_control_task(void *arg)
         TickType_t now = xTaskGetTickCount();
         int32_t output_rpm = 0;
 
+        /* Fault telemetry is sampled before choosing the next output so a
+         * newly reported controller fault cannot be followed by another
+         * nonzero keepalive. */
+        if (now - last_telemetry_request >= telemetry_interval) {
+            last_telemetry_request = now;
+            if (driver->getVescValues()) {
+                store_telemetry(vesc, *driver);
+            }
+        }
+
         xSemaphoreTake(vesc->lock, portMAX_DELAY);
 
         bool command_fresh = vesc->has_received_command &&
                              (now - vesc->last_command_tick <= command_timeout);
-        int32_t target_rpm = command_fresh ? vesc->requested_rpm : 0;
+        bool brake_active = !command_fresh || vesc->brake_requested ||
+                            (vesc->has_received_telemetry && vesc->fault_code != 0);
+        int32_t target_rpm = brake_active ? 0 : vesc->requested_rpm;
 
         if (target_rpm == 0) {
             vesc->active_rpm = 0;
@@ -83,13 +99,10 @@ static void vesc_control_task(void *arg)
         output_rpm = vesc->active_rpm;
         xSemaphoreGive(vesc->lock);
 
-        driver->setRPM((float)output_rpm);
-
-        if (now - last_telemetry_request >= telemetry_interval) {
-            last_telemetry_request = now;
-            if (driver->getVescValues()) {
-                store_telemetry(vesc, *driver);
-            }
+        if (brake_active) {
+            driver->setBrakeCurrent(LAKSA_REVIEWED_VESC_BRAKE_CURRENT_A);
+        } else {
+            driver->setRPM((float)output_rpm);
         }
 
         vTaskDelay(pdMS_TO_TICKS(VESC_SEND_INTERVAL_MS));
@@ -125,9 +138,9 @@ extern "C" esp_err_t vesc_uart_init(vesc_uart_t *vesc)
     vesc->serial_port = serial;
     vesc->driver = driver;
 
-    driver->setRPM(0.0f);
+    driver->setBrakeCurrent(LAKSA_REVIEWED_VESC_BRAKE_CURRENT_A);
     vTaskDelay(pdMS_TO_TICKS(5));
-    driver->setRPM(0.0f);
+    driver->setBrakeCurrent(LAKSA_REVIEWED_VESC_BRAKE_CURRENT_A);
 
     if (xTaskCreate(vesc_control_task,
                     "vesc_control",
@@ -154,15 +167,18 @@ extern "C" esp_err_t vesc_uart_init(vesc_uart_t *vesc)
     return ESP_OK;
 }
 
-extern "C" esp_err_t vesc_uart_set_target_rpm(vesc_uart_t *vesc, int32_t rpm)
+extern "C" esp_err_t vesc_uart_set_drive(vesc_uart_t *vesc, int32_t rpm, bool brake)
 {
+    int64_t signed_forward = (int64_t)rpm * LAKSA_REVIEWED_FORWARD_SIGN;
     if (vesc == nullptr || vesc->lock == nullptr ||
-        rpm < -VESC_MAX_ABS_RPM || rpm > VESC_MAX_ABS_RPM) {
+        signed_forward > LAKSA_REVIEWED_FORWARD_ERPM_LIMIT ||
+        signed_forward < -LAKSA_REVIEWED_REVERSE_ERPM_LIMIT) {
         return ESP_ERR_INVALID_ARG;
     }
 
     xSemaphoreTake(vesc->lock, portMAX_DELAY);
-    vesc->requested_rpm = rpm;
+    vesc->requested_rpm = brake ? 0 : rpm;
+    vesc->brake_requested = brake;
     vesc->last_command_tick = xTaskGetTickCount();
     vesc->has_received_command = true;
     if (rpm == 0) {
@@ -186,8 +202,18 @@ extern "C" esp_err_t vesc_uart_get_snapshot(vesc_uart_t *vesc, vesc_uart_snapsho
     snapshot->command_fresh = vesc->has_received_command &&
                               (now - vesc->last_command_tick <= pdMS_TO_TICKS(VESC_COMMAND_TIMEOUT_MS));
     snapshot->direction_change_pending = vesc->direction_change_pending;
+    snapshot->brake_active = !snapshot->command_fresh || vesc->brake_requested ||
+                             (vesc->has_received_telemetry && vesc->fault_code != 0);
     snapshot->telemetry_fresh = vesc->has_received_telemetry &&
                                 (now - vesc->last_telemetry_tick <= pdMS_TO_TICKS(VESC_TELEMETRY_STALE_MS));
+    snapshot->telemetry_sequence = vesc->telemetry_sequence;
+    if (vesc->has_received_telemetry) {
+        uint64_t age_ms = (uint64_t)(now - vesc->last_telemetry_tick) * 1000ULL /
+                          (uint64_t)configTICK_RATE_HZ;
+        snapshot->telemetry_age_ms = age_ms > UINT32_MAX ? UINT32_MAX : (uint32_t)age_ms;
+    } else {
+        snapshot->telemetry_age_ms = UINT32_MAX;
+    }
     snapshot->measured_rpm = vesc->measured_rpm;
     snapshot->motor_current = vesc->motor_current;
     snapshot->input_current = vesc->input_current;

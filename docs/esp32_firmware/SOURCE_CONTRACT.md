@@ -1,7 +1,8 @@
 # ESP32-S3 source and deployed-interface contract
 
-Status: Checkpoint 0 source reconciliation, 2026-09-29. This document is a
-review artifact, not authorization to flash or operate the car.
+Status: Checkpoint 1 host implementation, 2026-09-29. The operator reviewed
+Checkpoint 0 at `bb54f7b80ad655474e7cdbb412561f2fbcad543d` and authorized the
+seven-step reconciliation for host work only. This is not flash authorization.
 
 ## Claim vocabulary
 
@@ -167,7 +168,11 @@ IMU, while the hub path churned. This is limited, confounded evidence, not a
 permanent-stability claim and not a reason to extend the independent 500 ms
 command watchdog.
 
-## Smallest proposed reconciliation (not implemented)
+## Reviewed reconciliation
+
+This candidate implements the reviewed plan below. It is a newly reviewed
+firmware candidate derived from the phase source; it is **not** a reproduction
+of installed `cba74e7-dirty` and is not claimed byte- or behavior-identical.
 
 1. Retain the phase/production state and telemetry implementation as the base.
 2. Restore the donor's deployed boot/session brake-latch semantics, but define
@@ -182,10 +187,15 @@ command watchdog.
 7. Do not infer a final eRPM ceiling, conversion constants, brake current, or
    steering calibration from the incomplete dirty-image evidence.
 
-## Checkpoint 0 decision
+Implementation status: items 1, 3, 4, 5, and 6 are implemented. Item 2's
+interface and explicit-brake code path are restored, while its unknown current
+remains an intentional compile gate. Item 7 remains unresolved by design.
 
-Implementation is intentionally stopped. The external ROS ABI is sufficiently
-observed, but the exact actuator source path is not reproducible: the installed
-dirty edits, absolute eRPM ceiling, explicit brake-current value, and final
-steering mapping are unknown. Review must select/confirm the reconciliation
-above and provide the actuator constants/evidence before policy implementation.
+## Checkpoint 1 distinction
+
+The external ROS ABI is preserved and host-tested. The installed dirty edits,
+absolute forward/reverse ceilings, speed conversion, explicit brake-current
+value/action, and final steering mapping remain unknown. Zero sentinels in
+`actuator_release_config.h` are explicitly not car values, and the release
+build fails until those settings receive evidence-backed review. Host policy
+fixture values are isolated in the test source and have no firmware path.

@@ -1,7 +1,7 @@
 /* Embedded WiFi dashboard implementation.
  *
  * The ESP32 joins the configured WiFi network as a station and starts a small
- * HTTP server. The page polls JSON state and sends steering/VESC commands.
+ * HTTP server. The only registered routes are read-only diagnostics.
  */
 
 #include "web_dashboard.h"
@@ -46,12 +46,9 @@ static const char dashboard_html[] =
     ".muted{color:#91a0b5;font-size:13px}.bad{color:#ff8a8a}.ok{color:#86efac}"
     "</style></head><body><main><h1>LAKSA ESP32 Dashboard</h1><div class='grid'>"
     "<section><h2>Steering</h2><div class='row'><span>PCA9685 CH 7</span><span id='steerNow' class='value'>100&deg;</span></div>"
-    "<div class='controls'><button onclick='nudge(-2)'>&larr;</button><input id='steer' type='range' min='65' max='137' value='100' onchange='setSteering(this.value)'><button onclick='nudge(2)'>&rarr;</button></div>"
-    "<button style='width:100%;margin-top:10px' onclick='setSteering(100)'>Center: 100&deg;</button><div id='steerLimits' class='muted'></div></section>"
+    "<input id='steer' type='hidden' value='100'><div id='steerLimits' class='muted'></div><p class='muted'>Read-only diagnostics; actuator control is disabled.</p></section>"
     "<section><h2>VESC Motor</h2><div class='row'><span>Commanded ERPM</span><span id='motorRpm' class='value'>0</span></div>"
-    "<div class='row'><span>Command limit</span><span id='speedValue' class='value'>900 ERPM</span></div><input id='speed' type='range' min='100' max='900' step='50' value='900' oninput='speedValue.textContent=this.value+\" ERPM\"'>"
-    "<div class='drive'><button id='reverse'>Reverse</button><button class='stop' onclick='stopMotor()'>STOP</button><button id='forward'>Forward</button></div>"
-    "<div id='motorStatus' class='muted'>Hold a direction button to move</div>"
+    "<button id='reverse' hidden></button><button id='forward' hidden></button><div id='motorStatus' class='muted'>Read-only diagnostics; actuator control is disabled.</div>"
     "<hr style='border:0;border-top:1px solid #283548;margin:14px 0'><div class='row'><span>UART Telemetry</span><span id='vescLink' class='bad'>no data</span></div>"
     "<div class='row'><span>Measured ERPM</span><span id='vescRpm' class='value'>--</span></div>"
     "<div class='row'><span>Input voltage</span><span id='vescVoltage' class='value'>--</span></div>"
@@ -62,14 +59,8 @@ static const char dashboard_html[] =
     "<div class='row'><span>Tachometer / fault</span><span id='vescTacho' class='value'>--</span></div></section>"
     "<section><h2>IMU</h2><div class='row'><span>Transport</span><span id='transport' class='value'></span></div>"
     "<div id='imu'></div></section></div></main><script>"
-    "let driveTimer=null,driveSign=0;"
     "function fmt(v,n=3){return Number(v||0).toFixed(n)}"
-    "async function setSteering(angle){angle=Math.max(65,Math.min(137,Math.round(angle)));steer.value=angle;await fetch(`/api/steering?angle=${angle}`)}"
-    "function nudge(delta){setSteering(Number(steer.value)+delta)}"
-    "function sendMotor(){let rpm=driveSign*Number(speed.value);fetch(`/api/motor?rpm=${rpm}`).catch(()=>stopMotor())}"
-    "function startMotor(sign){stopMotor(false);driveSign=sign;sendMotor();driveTimer=setInterval(sendMotor,100)}"
-    "function stopMotor(send=true){if(driveTimer)clearInterval(driveTimer);driveTimer=null;driveSign=0;if(send)fetch('/api/motor?rpm=0').catch(()=>{})}"
-    "function bindHold(el,sign){el.addEventListener('pointerdown',e=>{e.preventDefault();el.setPointerCapture(e.pointerId);startMotor(sign)});el.addEventListener('pointerup',()=>stopMotor());el.addEventListener('pointercancel',()=>stopMotor());el.addEventListener('lostpointercapture',()=>stopMotor())}"
+    "function stopMotor(){}function bindHold(){}"
     "function quat(name,q,showAcc=true){let acc=showAcc?` acc ${fmt(q.accuracy,4)}`:'';return `<div class='row'><span>${name}</span><span class='${q.has?'ok':'bad'}'>${q.has?'Y':'N'}</span></div><div class='value'>i ${fmt(q.i,4)} j ${fmt(q.j,4)} k ${fmt(q.k,4)} r ${fmt(q.real,4)}${acc}</div>`}"
     "async function refresh(){try{let r=await fetch('/api/state');let d=await r.json();steerNow.textContent=d.steering.current+'\u00b0 (target '+d.steering.target+'\u00b0)';if(document.activeElement!==steer)steer.value=d.steering.target;steerLimits.textContent=`Safe range ${d.steering.left}\u00b0 - ${d.steering.right}\u00b0${d.steering.endpoint_relief?' - endpoint relieved':''}`;motorRpm.textContent=d.motor.active_rpm;motorStatus.textContent=d.motor.direction_change_pending?'Neutral pause before direction change':(!d.motor.command_fresh&&d.motor.requested_rpm!==0?'Stopped by watchdog':(d.motor.active_rpm===0?'Stopped':'Web command active'));motorStatus.className=d.motor.active_rpm!==0?'muted ok':'muted';let t=d.motor.telemetry;vescLink.textContent=t.fresh?'connected':'no recent data';vescLink.className=t.fresh?'ok':'bad';vescRpm.textContent=t.fresh?Math.round(t.rpm):'--';vescVoltage.textContent=t.fresh?fmt(t.input_voltage,1)+' V':'--';vescCurrent.textContent=t.fresh?fmt(t.motor_current,1)+' / '+fmt(t.input_current,1)+' A':'--';vescDuty.textContent=t.fresh?fmt(t.duty*100,1)+' %':'--';vescTemp.textContent=t.fresh?fmt(t.temp_mosfet,1)+' / '+fmt(t.temp_motor,1)+' \u00b0C':'--';vescEnergy.textContent=t.fresh?fmt(t.watt_hours,2)+' / '+fmt(t.watt_hours_charged,2)+' Wh':'--';vescTacho.textContent=t.fresh?t.tachometer+' / '+t.fault_code:'--';transport.textContent=d.imu.transport;imu.innerHTML=`<div class='row'><span>Acceleration</span><span class='${d.imu.accel.has?'ok':'bad'}'>${d.imu.accel.has?'Y':'N'}</span></div><div class='value'>x ${fmt(d.imu.accel.x)} y ${fmt(d.imu.accel.y)} z ${fmt(d.imu.accel.z)}</div>${quat('Rotation',d.imu.rotation)}${quat('Game rotation',d.imu.game_rotation,false)}`}"
     "catch(e){imu.innerHTML='<span class=bad>offline</span>'}}"
@@ -195,7 +186,7 @@ static esp_err_t state_handler(httpd_req_t *req)
                        HTTP_RESPONSE_BUF_LEN,
                        "{\"steering\":{\"channel\":%d,\"left\":%d,\"center\":%d,\"right\":%d,"
                        "\"target\":%u,\"current\":%u,\"endpoint_relief\":%s},"
-                       "\"motor\":{\"requested_rpm\":%ld,\"active_rpm\":%ld,\"max_abs_rpm\":%d,"
+                       "\"motor\":{\"requested_rpm\":%ld,\"active_rpm\":%ld,"
                        "\"command_fresh\":%s,\"direction_change_pending\":%s,"
                        "\"telemetry\":{\"fresh\":%s,\"rpm\":%.1f,\"motor_current\":%.2f,"
                        "\"input_current\":%.2f,\"duty\":%.4f,\"input_voltage\":%.1f,"
@@ -216,7 +207,6 @@ static esp_err_t state_handler(httpd_req_t *req)
                        steering.endpoint_relief_active ? "true" : "false",
                        (long)motor.requested_rpm,
                        (long)motor.active_rpm,
-                       VESC_MAX_ABS_RPM,
                        motor.command_fresh ? "true" : "false",
                        motor.direction_change_pending ? "true" : "false",
                        motor.telemetry_fresh ? "true" : "false",
@@ -265,59 +255,6 @@ static esp_err_t state_handler(httpd_req_t *req)
     return err;
 }
 
-static esp_err_t steering_handler(httpd_req_t *req)
-{
-    web_dashboard_t *dashboard = (web_dashboard_t *)req->user_ctx;
-    char query[HTTP_QUERY_BUF_LEN] = {0};
-    char angle_text[8] = {0};
-
-    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
-        httpd_query_key_value(query, "angle", angle_text, sizeof(angle_text)) != ESP_OK) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "expected angle");
-    }
-
-    char *end = NULL;
-    long angle = strtol(angle_text, &end, 10);
-    if (end == angle_text || *end != '\0' ||
-        angle < STEERING_LEFT_SAFE_DEG || angle > STEERING_RIGHT_SAFE_DEG) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "angle outside safe steering range");
-    }
-
-    esp_err_t err = steering_control_set_target(dashboard->steering, (uint8_t)angle);
-    if (err != ESP_OK) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
-    }
-
-    httpd_resp_set_type(req, "application/json");
-    return httpd_resp_sendstr(req, "{\"ok\":true}");
-}
-
-static esp_err_t motor_handler(httpd_req_t *req)
-{
-    web_dashboard_t *dashboard = (web_dashboard_t *)req->user_ctx;
-    char query[HTTP_QUERY_BUF_LEN] = {0};
-    char rpm_text[16] = {0};
-
-    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
-        httpd_query_key_value(query, "rpm", rpm_text, sizeof(rpm_text)) != ESP_OK) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "expected rpm");
-    }
-
-    char *end = NULL;
-    long rpm = strtol(rpm_text, &end, 10);
-    if (end == rpm_text || *end != '\0' || rpm < -VESC_MAX_ABS_RPM || rpm > VESC_MAX_ABS_RPM) {
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "rpm outside safe range");
-    }
-
-    esp_err_t err = vesc_uart_set_target_rpm(dashboard->vesc, (int32_t)rpm);
-    if (err != ESP_OK) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
-    }
-
-    httpd_resp_set_type(req, "application/json");
-    return httpd_resp_sendstr(req, "{\"ok\":true}");
-}
-
 esp_err_t web_dashboard_start(web_dashboard_t *dashboard)
 {
     if (dashboard == NULL || dashboard->steering == NULL || dashboard->vesc == NULL) {
@@ -346,23 +283,9 @@ esp_err_t web_dashboard_start(web_dashboard_t *dashboard)
         .handler = state_handler,
         .user_ctx = active_dashboard,
     };
-    httpd_uri_t steering_uri = {
-        .uri = "/api/steering",
-        .method = HTTP_GET,
-        .handler = steering_handler,
-        .user_ctx = active_dashboard,
-    };
-    httpd_uri_t motor_uri = {
-        .uri = "/api/motor",
-        .method = HTTP_GET,
-        .handler = motor_handler,
-        .user_ctx = active_dashboard,
-    };
 
     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server, &index_uri), TAG, "index route failed");
     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server, &state_uri), TAG, "state route failed");
-    ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server, &steering_uri), TAG, "steering route failed");
-    ESP_RETURN_ON_ERROR(httpd_register_uri_handler(server, &motor_uri), TAG, "motor route failed");
 
     return ESP_OK;
 }

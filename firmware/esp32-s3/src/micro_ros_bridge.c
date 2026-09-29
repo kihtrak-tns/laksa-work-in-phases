@@ -5,6 +5,8 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "actuator_policy.h"
+#include "actuator_release_config.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_usbcdc_transport.h"
@@ -12,7 +14,6 @@
 #include "freertos/task.h"
 #include "sdkconfig.h"
 
-#include <geometry_msgs/msg/twist.h>
 #include <laksa_interfaces/msg/drive_command.h>
 #include <laksa_interfaces/msg/pca9685_state.h>
 #include <laksa_interfaces/msg/vehicle_state.h>
@@ -26,6 +27,7 @@
 #include <rosidl_runtime_c/string_functions.h>
 #include <sensor_msgs/msg/imu.h>
 #include <sensor_msgs/msg/magnetic_field.h>
+#include <std_msgs/msg/bool.h>
 
 #define MICRO_ROS_TASK_STACK_SIZE 20000
 #define MICRO_ROS_TASK_PRIORITY 5
@@ -50,6 +52,7 @@ typedef enum {
 
 typedef struct {
     micro_ros_bridge_config_t hardware;
+    actuator_policy_t policy;
     rcl_allocator_t allocator;
     rclc_support_t support;
     rcl_node_t node;
@@ -60,7 +63,7 @@ typedef struct {
     rcl_publisher_t state_publisher;
     rcl_publisher_t pca_publisher;
     rcl_subscription_t command_subscription;
-    rcl_subscription_t cmd_vel_subscription;
+    rcl_subscription_t brake_subscription;
     rcl_service_t set_command_service;
     rcl_service_t get_state_service;
     sensor_msgs__msg__Imu imu_message;
@@ -69,7 +72,7 @@ typedef struct {
     laksa_interfaces__msg__VehicleState state_message;
     laksa_interfaces__msg__Pca9685State pca_message;
     laksa_interfaces__msg__DriveCommand command_message;
-    geometry_msgs__msg__Twist cmd_vel_message;
+    std_msgs__msg__Bool brake_message;
     laksa_interfaces__srv__SetDriveCommand_Request set_request;
     laksa_interfaces__srv__SetDriveCommand_Response set_response;
     laksa_interfaces__srv__GetVehicleState_Request get_request;
@@ -86,97 +89,72 @@ static void consume_rcl_result(rcl_ret_t result)
     (void)result;
 }
 
-static float wheel_diameter_m(void)
-{
-    return (float)CONFIG_LAKSA_WHEEL_DIAMETER_MM / 1000.0f;
-}
-
-static float gear_reduction(void)
-{
-    return (float)CONFIG_LAKSA_GEAR_REDUCTION_X1000 / 1000.0f;
-}
-
-static float max_steering_angle_rad(void)
-{
-    return (float)CONFIG_LAKSA_MAX_STEERING_ANGLE_MRAD / 1000.0f;
-}
-
-static bool speed_to_erpm(float speed_mps, int32_t *erpm)
-{
-    if (erpm == NULL || !isfinite(speed_mps)) {
-        return false;
-    }
-
-    float circumference_m = MICRO_ROS_PI * wheel_diameter_m();
-    float value = speed_mps * 60.0f * gear_reduction() *
-                  (float)CONFIG_LAKSA_MOTOR_POLE_PAIRS /
-                  circumference_m * (float)CONFIG_LAKSA_DRIVE_FORWARD_SIGN;
-    if (!isfinite(value) || fabsf(value) > (float)VESC_MAX_ABS_RPM) {
-        return false;
-    }
-
-    *erpm = (int32_t)lroundf(value);
-    return true;
-}
-
 static float erpm_to_speed(float erpm)
 {
-    float circumference_m = MICRO_ROS_PI * wheel_diameter_m();
+    float circumference_m = MICRO_ROS_PI * LAKSA_REVIEWED_WHEEL_DIAMETER_M;
     return erpm * circumference_m /
-           (60.0f * gear_reduction() * (float)CONFIG_LAKSA_MOTOR_POLE_PAIRS) *
-           (float)CONFIG_LAKSA_DRIVE_FORWARD_SIGN;
-}
-
-static bool steering_rad_to_servo(float steering_rad, uint8_t *servo_angle_deg)
-{
-    if (servo_angle_deg == NULL || !isfinite(steering_rad) ||
-        fabsf(steering_rad) > max_steering_angle_rad()) {
-        return false;
-    }
-
-    float normalized = fabsf(steering_rad) / max_steering_angle_rad();
-    float servo_angle;
-    if (steering_rad >= 0.0f) {
-        servo_angle = (float)STEERING_CENTER_DEG -
-                      normalized * (float)(STEERING_CENTER_DEG - STEERING_LEFT_SAFE_DEG);
-    } else {
-        servo_angle = (float)STEERING_CENTER_DEG +
-                      normalized * (float)(STEERING_RIGHT_SAFE_DEG - STEERING_CENTER_DEG);
-    }
-    *servo_angle_deg = (uint8_t)lroundf(servo_angle);
-    return true;
+           (60.0f * LAKSA_REVIEWED_GEAR_REDUCTION *
+            (float)LAKSA_REVIEWED_MOTOR_POLE_PAIRS) *
+           (float)LAKSA_REVIEWED_FORWARD_SIGN;
 }
 
 static float servo_to_steering_rad(uint8_t servo_angle_deg)
 {
-    if (servo_angle_deg <= STEERING_CENTER_DEG) {
-        return ((float)(STEERING_CENTER_DEG - servo_angle_deg) /
-                (float)(STEERING_CENTER_DEG - STEERING_LEFT_SAFE_DEG)) *
-               max_steering_angle_rad();
+    if (servo_angle_deg <= LAKSA_REVIEWED_STEERING_CENTER_SERVO_DEG) {
+        return ((float)(LAKSA_REVIEWED_STEERING_CENTER_SERVO_DEG - servo_angle_deg) /
+                (float)(LAKSA_REVIEWED_STEERING_CENTER_SERVO_DEG -
+                        LAKSA_REVIEWED_STEERING_LEFT_SERVO_DEG)) *
+               LAKSA_REVIEWED_STEERING_LEFT_LIMIT_RAD;
     }
-    return -((float)(servo_angle_deg - STEERING_CENTER_DEG) /
-             (float)(STEERING_RIGHT_SAFE_DEG - STEERING_CENTER_DEG)) *
-           max_steering_angle_rad();
+    return ((float)(servo_angle_deg - LAKSA_REVIEWED_STEERING_CENTER_SERVO_DEG) /
+            (float)(LAKSA_REVIEWED_STEERING_RIGHT_SERVO_DEG -
+                    LAKSA_REVIEWED_STEERING_CENTER_SERVO_DEG)) *
+           LAKSA_REVIEWED_STEERING_RIGHT_LIMIT_RAD;
 }
 
-static uint8_t apply_drive_command(float speed_mps, float steering_angle_rad)
+static uint64_t policy_now_ms(void)
 {
-    int32_t erpm;
-    uint8_t servo_angle;
-    if (!speed_to_erpm(speed_mps, &erpm)) {
-        return 1;
+    return (uint64_t)esp_timer_get_time() / 1000ULL;
+}
+
+static uint8_t apply_policy_now(void)
+{
+    vesc_uart_snapshot_t snapshot = {0};
+    if (vesc_uart_get_snapshot(bridge.hardware.vesc, &snapshot) == ESP_OK) {
+        actuator_policy_set_fault(&bridge.policy, snapshot.fault_code != 0);
     }
-    if (!steering_rad_to_servo(steering_angle_rad, &servo_angle)) {
-        return 2;
-    }
-    if (vesc_uart_set_target_rpm(bridge.hardware.vesc, erpm) != ESP_OK) {
+
+    actuator_policy_output_t output =
+        actuator_policy_evaluate(&bridge.policy, policy_now_ms());
+    if (vesc_uart_set_drive(bridge.hardware.vesc, output.vesc_erpm,
+                            output.brake_requested) != ESP_OK) {
         return 3;
     }
-    if (steering_control_set_target(bridge.hardware.steering, servo_angle) != ESP_OK) {
-        (void)vesc_uart_set_target_rpm(bridge.hardware.vesc, 0);
+    if (steering_control_set_target(bridge.hardware.steering,
+                                    output.steering_servo_deg) != ESP_OK) {
+        (void)vesc_uart_set_drive(bridge.hardware.vesc, 0, true);
         return 4;
     }
     return 0;
+}
+
+static uint8_t submit_drive_command(float speed_mps,
+                                    float steering_angle_rad,
+                                    bool brake_requested,
+                                    actuator_command_source_t source)
+{
+    actuator_policy_command_t command = {
+        .speed_mps = speed_mps,
+        .steering_angle_rad = steering_angle_rad,
+        .brake = brake_requested,
+    };
+    actuator_policy_error_t error = actuator_policy_submit(
+        &bridge.policy, &command, source, policy_now_ms());
+    uint8_t apply_error = apply_policy_now();
+    if (error != ACTUATOR_POLICY_OK) {
+        return (uint8_t)error;
+    }
+    return apply_error;
 }
 
 static builtin_interfaces__msg__Time ros_time_now(void)
@@ -228,7 +206,10 @@ static void fill_vesc_state(laksa_interfaces__msg__VescState *message,
     message->stamp = stamp;
     message->command_fresh = snapshot->command_fresh;
     message->direction_change_pending = snapshot->direction_change_pending;
+    message->brake_active = snapshot->brake_active;
     message->telemetry_fresh = snapshot->telemetry_fresh;
+    message->telemetry_sequence = snapshot->telemetry_sequence;
+    message->telemetry_age_ms = snapshot->telemetry_age_ms;
     message->requested_erpm = snapshot->requested_rpm;
     message->active_erpm = snapshot->active_rpm;
     message->measured_erpm = snapshot->measured_rpm;
@@ -248,9 +229,10 @@ static void fill_vesc_state(laksa_interfaces__msg__VescState *message,
     message->controller_id = snapshot->controller_id;
     message->fault_code = snapshot->fault_code;
     message->motor_angular_velocity_rad_s =
-        snapshot->measured_rpm / (float)CONFIG_LAKSA_MOTOR_POLE_PAIRS *
+        snapshot->measured_rpm / (float)LAKSA_REVIEWED_MOTOR_POLE_PAIRS *
         (2.0f * MICRO_ROS_PI / 60.0f);
-    message->wheel_angular_velocity_rad_s = speed_mps / (wheel_diameter_m() * 0.5f);
+    message->wheel_angular_velocity_rad_s =
+        speed_mps / (LAKSA_REVIEWED_WHEEL_DIAMETER_M * 0.5f);
     message->vehicle_linear_velocity_mps = speed_mps;
 }
 
@@ -371,28 +353,26 @@ static void fill_imu_messages(void)
     bridge.mag_message.magnetic_field_covariance[0] = has_mag ? 0.0 : -1.0;
 }
 
+static void brake_callback(const void *message)
+{
+    const std_msgs__msg__Bool *brake = (const std_msgs__msg__Bool *)message;
+    actuator_policy_set_session_brake(&bridge.policy, brake->data);
+    uint8_t error = apply_policy_now();
+    if (error != 0) {
+        ESP_LOGW(TAG, "Failed to apply session brake (error %u)", (unsigned)error);
+    }
+}
+
 static void command_callback(const void *message)
 {
     const laksa_interfaces__msg__DriveCommand *command =
         (const laksa_interfaces__msg__DriveCommand *)message;
-    uint8_t error = apply_drive_command(command->speed_mps, command->steering_angle_rad);
+    uint8_t error = submit_drive_command(command->speed_mps,
+                                         command->steering_angle_rad,
+                                         command->brake,
+                                         ACTUATOR_COMMAND_SOURCE_TOPIC);
     if (error != 0) {
         ESP_LOGW(TAG, "Rejected drive command (error %u)", (unsigned)error);
-    }
-}
-
-static void cmd_vel_callback(const void *message)
-{
-    const geometry_msgs__msg__Twist *command = (const geometry_msgs__msg__Twist *)message;
-    float speed = (float)command->linear.x;
-    float steering = 0.0f;
-    if (fabsf(speed) > 0.01f) {
-        steering = atanf(((float)CONFIG_LAKSA_WHEELBASE_MM / 1000.0f) *
-                         (float)command->angular.z / speed);
-    }
-    uint8_t error = apply_drive_command(speed, steering);
-    if (error != 0) {
-        ESP_LOGW(TAG, "Rejected cmd_vel (error %u)", (unsigned)error);
     }
 }
 
@@ -402,8 +382,11 @@ static void set_command_callback(const void *request, void *response)
         (const laksa_interfaces__srv__SetDriveCommand_Request *)request;
     laksa_interfaces__srv__SetDriveCommand_Response *set_response =
         (laksa_interfaces__srv__SetDriveCommand_Response *)response;
-    set_response->error_code = apply_drive_command(set_request->command.speed_mps,
-                                                   set_request->command.steering_angle_rad);
+    set_response->error_code = submit_drive_command(
+        set_request->command.speed_mps,
+        set_request->command.steering_angle_rad,
+        set_request->command.brake,
+        ACTUATOR_COMMAND_SOURCE_SERVICE);
     set_response->accepted = set_response->error_code == 0;
 }
 
@@ -455,11 +438,11 @@ static bool create_entities(void)
     }
 
     bridge.command_subscription = rcl_get_zero_initialized_subscription();
-    bridge.cmd_vel_subscription = rcl_get_zero_initialized_subscription();
+    bridge.brake_subscription = rcl_get_zero_initialized_subscription();
     if (rclc_subscription_init_default(&bridge.command_subscription, &bridge.node,
             ROSIDL_GET_MSG_TYPE_SUPPORT(laksa_interfaces, msg, DriveCommand), "/laksa/command") != RCL_RET_OK ||
-        rclc_subscription_init_default(&bridge.cmd_vel_subscription, &bridge.node,
-            ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist), "/cmd_vel") != RCL_RET_OK) {
+        rclc_subscription_init_default(&bridge.brake_subscription, &bridge.node,
+            ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool), "/laksa/brake") != RCL_RET_OK) {
         return false;
     }
 
@@ -480,7 +463,7 @@ static bool create_entities(void)
         !laksa_interfaces__msg__VehicleState__init(&bridge.state_message) ||
         !laksa_interfaces__msg__Pca9685State__init(&bridge.pca_message) ||
         !laksa_interfaces__msg__DriveCommand__init(&bridge.command_message) ||
-        !geometry_msgs__msg__Twist__init(&bridge.cmd_vel_message) ||
+        !std_msgs__msg__Bool__init(&bridge.brake_message) ||
         !laksa_interfaces__srv__SetDriveCommand_Request__init(&bridge.set_request) ||
         !laksa_interfaces__srv__SetDriveCommand_Response__init(&bridge.set_response) ||
         !laksa_interfaces__srv__GetVehicleState_Request__init(&bridge.get_request) ||
@@ -497,8 +480,8 @@ static bool create_entities(void)
                            MICRO_ROS_EXECUTOR_HANDLES, &bridge.allocator) != RCL_RET_OK ||
         rclc_executor_add_subscription(&bridge.executor, &bridge.command_subscription,
                                        &bridge.command_message, command_callback, ON_NEW_DATA) != RCL_RET_OK ||
-        rclc_executor_add_subscription(&bridge.executor, &bridge.cmd_vel_subscription,
-                                       &bridge.cmd_vel_message, cmd_vel_callback, ON_NEW_DATA) != RCL_RET_OK ||
+        rclc_executor_add_subscription(&bridge.executor, &bridge.brake_subscription,
+                                       &bridge.brake_message, brake_callback, ON_NEW_DATA) != RCL_RET_OK ||
         rclc_executor_add_service(&bridge.executor, &bridge.set_command_service,
                                   &bridge.set_request, &bridge.set_response,
                                   set_command_callback) != RCL_RET_OK ||
@@ -515,8 +498,8 @@ static bool create_entities(void)
 
 static void destroy_entities(void)
 {
-    (void)vesc_uart_set_target_rpm(bridge.hardware.vesc, 0);
-    (void)steering_control_center(bridge.hardware.steering);
+    actuator_policy_set_session_brake(&bridge.policy, true);
+    (void)apply_policy_now();
     if (!bridge.entities_created) {
         memset(&bridge.support, 0, sizeof(bridge.support));
         return;
@@ -529,7 +512,7 @@ static void destroy_entities(void)
     (void)rclc_executor_fini(&bridge.executor);
     consume_rcl_result(rcl_service_fini(&bridge.get_state_service, &bridge.node));
     consume_rcl_result(rcl_service_fini(&bridge.set_command_service, &bridge.node));
-    consume_rcl_result(rcl_subscription_fini(&bridge.cmd_vel_subscription, &bridge.node));
+    consume_rcl_result(rcl_subscription_fini(&bridge.brake_subscription, &bridge.node));
     consume_rcl_result(rcl_subscription_fini(&bridge.command_subscription, &bridge.node));
     consume_rcl_result(rcl_publisher_fini(&bridge.state_publisher, &bridge.node));
     consume_rcl_result(rcl_publisher_fini(&bridge.pca_publisher, &bridge.node));
@@ -545,7 +528,7 @@ static void destroy_entities(void)
     laksa_interfaces__msg__VehicleState__fini(&bridge.state_message);
     laksa_interfaces__msg__Pca9685State__fini(&bridge.pca_message);
     laksa_interfaces__msg__DriveCommand__fini(&bridge.command_message);
-    geometry_msgs__msg__Twist__fini(&bridge.cmd_vel_message);
+    std_msgs__msg__Bool__fini(&bridge.brake_message);
     laksa_interfaces__srv__SetDriveCommand_Request__fini(&bridge.set_request);
     laksa_interfaces__srv__SetDriveCommand_Response__fini(&bridge.set_response);
     laksa_interfaces__srv__GetVehicleState_Request__fini(&bridge.get_request);
@@ -627,6 +610,7 @@ static void micro_ros_task(void *argument)
                 }
             }
             (void)rclc_executor_spin_some(&bridge.executor, RCL_MS_TO_NS(5));
+            (void)apply_policy_now();
             publish_periodic(now, &last_imu, &last_mag, &last_state, &last_pca);
             vTaskDelay(pdMS_TO_TICKS(2));
             break;
@@ -648,6 +632,27 @@ esp_err_t micro_ros_bridge_start(const micro_ros_bridge_config_t *config)
 
     memset(&bridge, 0, sizeof(bridge));
     bridge.hardware = *config;
+    actuator_policy_config_t policy_config = {
+        .command_timeout_ms = VESC_COMMAND_TIMEOUT_MS,
+        .direction_neutral_ms = VESC_DIRECTION_CHANGE_NEUTRAL_MS,
+        .forward_speed_limit_mps = LAKSA_REVIEWED_FORWARD_SPEED_LIMIT_MPS,
+        .reverse_speed_limit_mps = LAKSA_REVIEWED_REVERSE_SPEED_LIMIT_MPS,
+        .forward_erpm_limit = LAKSA_REVIEWED_FORWARD_ERPM_LIMIT,
+        .reverse_erpm_limit = LAKSA_REVIEWED_REVERSE_ERPM_LIMIT,
+        .steering_left_limit_rad = LAKSA_REVIEWED_STEERING_LEFT_LIMIT_RAD,
+        .steering_right_limit_rad = LAKSA_REVIEWED_STEERING_RIGHT_LIMIT_RAD,
+        .wheel_diameter_m = LAKSA_REVIEWED_WHEEL_DIAMETER_M,
+        .gear_reduction = LAKSA_REVIEWED_GEAR_REDUCTION,
+        .motor_pole_pairs = LAKSA_REVIEWED_MOTOR_POLE_PAIRS,
+        .forward_sign = LAKSA_REVIEWED_FORWARD_SIGN,
+        .steering_left_servo_deg = LAKSA_REVIEWED_STEERING_LEFT_SERVO_DEG,
+        .steering_center_servo_deg = LAKSA_REVIEWED_STEERING_CENTER_SERVO_DEG,
+        .steering_right_servo_deg = LAKSA_REVIEWED_STEERING_RIGHT_SERVO_DEG,
+    };
+    if (actuator_policy_init(&bridge.policy, &policy_config) != ACTUATOR_POLICY_OK) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    (void)apply_policy_now();
 
 #if defined(RMW_UXRCE_TRANSPORT_CUSTOM)
     if (rmw_uros_set_custom_transport(true, &cdc_port,
