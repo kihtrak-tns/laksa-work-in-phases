@@ -1,7 +1,15 @@
+# VESC telemetry from the ESP32 micro-ROS bridge.
+# Layout matches the handoff branch (autonomy-handoff-2026-09-02, 4787d05)
+# and the installed ESP32 firmware (cba74e7-dirty). The production mainline
+# (1f0db4f) omits brake_active, telemetry_sequence and telemetry_age_ms —
+# that layout does NOT match the flashed build and must not be used.
 builtin_interfaces/Time stamp
 bool command_fresh
 bool direction_change_pending
+bool brake_active
 bool telemetry_fresh
+uint32 telemetry_sequence
+uint32 telemetry_age_ms
 int32 requested_erpm
 int32 active_erpm
 float32 measured_erpm
