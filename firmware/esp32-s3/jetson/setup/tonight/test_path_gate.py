@@ -11,8 +11,8 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from path_gate import (FAIL, NONE, PASS, STATUS_EXECUTING, GateState, Grid,  # noqa: E402
-                       check_plan)
+from path_gate import (COSTMAP_MAX_AGE_S, FAIL, NONE, PASS, STATUS_MAX_AGE_S,  # noqa: E402
+                       STATUS_ACCEPTED, STATUS_EXECUTING, GateState, Grid, check_plan)
 
 NOW = 1000.0
 
@@ -196,3 +196,75 @@ def test_canceling_goal_is_not_forwarded():
     state.on_status([("g1", 100.0, 3)])                      # CANCELING
     assert state.verdict == PASS
     assert state.on_twist(0.2) == (False, False)
+
+
+# -------------------------------------------- concurrent plan / staleness tests
+def test_unrelated_plan_cannot_authorize_after_pass():
+    """Once a plan has been accepted (PASS) for a goal, a second plan from an
+    unrelated ComputePathToPose must be ignored — it cannot re-authorize or
+    change the verdict."""
+    state = GateState()
+    state.on_status(GOAL)
+    assert state.on_plan(101.0, passing()) == "pass"
+    assert state.verdict == PASS
+    # An unrelated console plan arrives later with a newer stamp.
+    assert state.on_plan(102.0, passing()) == "ignored"
+    assert state.verdict == PASS                             # unchanged
+
+
+def test_unrelated_plan_cannot_authorize_separate_goal():
+    """A plan from ComputePathToPose (not triggered by NavigateToPose) that
+    happens to have a stamp newer than the goal's must not authorize forwarding.
+    The first plan evaluated per goal is the only one that counts."""
+    state = GateState()
+    state.on_status(GOAL)
+    # The BT's own plan arrives and passes.
+    assert state.on_plan(101.0, passing()) == "pass"
+    # Console fires a separate ComputePathToPose → /plan with a much later stamp.
+    assert state.on_plan(200.0, check([])) == "ignored"      # empty path would fail, but ignored
+    assert state.verdict == PASS                             # verdict preserved
+
+
+def test_costmap_stale_during_forwarding_fails():
+    """Costmap going stale while forwarding must transition to FAIL."""
+    state = GateState()
+    state.on_status(GOAL)
+    state.on_plan(101.0, passing())
+    assert state.verdict == PASS
+    # Costmap fresh: no transition.
+    assert state.check_freshness(costmap_age_s=2.0, status_age_s=1.0) is False
+    assert state.verdict == PASS
+    # Costmap stale: transitions to FAIL.
+    assert state.check_freshness(costmap_age_s=COSTMAP_MAX_AGE_S + 1.0, status_age_s=1.0) is True
+    assert state.verdict == FAIL
+    assert any("costmap stale" in r for r in state.reasons)
+
+
+def test_status_stale_during_forwarding_fails():
+    """Goal-status stream going stale while forwarding must transition to FAIL."""
+    state = GateState()
+    state.on_status(GOAL)
+    state.on_plan(101.0, passing())
+    assert state.verdict == PASS
+    # Status fresh: no transition.
+    assert state.check_freshness(costmap_age_s=1.0, status_age_s=2.0) is False
+    assert state.verdict == PASS
+    # Status stale: transitions to FAIL.
+    assert state.check_freshness(costmap_age_s=1.0, status_age_s=STATUS_MAX_AGE_S + 1.0) is True
+    assert state.verdict == FAIL
+    assert any("goal status stale" in r for r in state.reasons)
+
+
+def test_freshness_check_only_fires_during_pass():
+    """check_freshness should be a no-op when verdict is not PASS."""
+    state = GateState()
+    # No goal: no-op even with extreme ages.
+    assert state.check_freshness(costmap_age_s=999.0, status_age_s=999.0) is False
+    # With a goal but NONE verdict: no-op.
+    state.on_status(GOAL)
+    assert state.verdict == NONE
+    assert state.check_freshness(costmap_age_s=999.0, status_age_s=999.0) is False
+    # After FAIL: no-op (already failed).
+    state.on_plan(101.0, check([]))
+    assert state.verdict == FAIL
+    assert state.check_freshness(costmap_age_s=999.0, status_age_s=999.0) is False

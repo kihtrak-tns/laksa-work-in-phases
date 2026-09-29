@@ -11,12 +11,18 @@ after nav_timeout_sec (0.25 s).
 Verdict per goal (from /navigate_to_pose/_action/status):
   * A new goal starts at NONE.  Only a /plan whose header.stamp is later than
     the goal's goal_info.stamp is evaluated for it.
+  * One plan per goal: once a plan has been evaluated (PASS or FAIL), all
+    subsequent plans are ignored for that goal.  This prevents an unrelated
+    ComputePathToPose (e.g. from the console) from authorizing or overriding
+    the verdict for a NavigateToPose goal.
   * The plan passes only if all checks pass: /plan and the global costmap are
     in the map frame and the costmap is under 3 s old; the padded footprint at
     every pose (resampled at <= 0.05 m) covers no cell >= 99, no unknown cell
     and nothing outside the grid; no cusp or reverse segment (forward_only);
     curvature never above 0.914 * 1.10 1/m.
   * While forwarding, a Twist with linear.x < 0 (or non-finite) fails the goal.
+  * While forwarding, the costmap must stay under 3 s old and the goal-status
+    stream must arrive at least every 5 s; either going stale fails the goal.
   * FAIL latches for the rest of that goal: the gate publishes Empty on
     /laksa/cancel_navigation and cancels every /navigate_to_pose goal.
 
@@ -47,6 +53,7 @@ MAX_CURVATURE = 0.914 * 1.10
 RESAMPLE_M = 0.05
 CURVATURE_WINDOW_M = 0.20       # chord on each side of a point for the curvature estimate
 COSTMAP_MAX_AGE_S = 3.0
+STATUS_MAX_AGE_S = 5.0          # goal-status stream must arrive at least this often while forwarding
 BLOCKED_COST = 99               # OccupancyGrid scale: 99 inscribed, 100 lethal, -1 unknown
 LETHAL_COST = 100
 CLEARANCE_SEARCH_M = 1.0
@@ -317,10 +324,16 @@ class GateState:
         return True
 
     def on_plan(self, plan_stamp: float, check: PlanCheck) -> str:
-        """Returns 'ignored', 'pass' or 'fail' ('fail' only on the transition into FAIL)."""
+        """Returns 'ignored', 'pass' or 'fail' ('fail' only on the transition into FAIL).
+
+        One-plan-per-goal: once a plan has been evaluated for this goal (verdict
+        moved to PASS or FAIL), all subsequent plans are ignored.  This prevents
+        an unrelated ComputePathToPose from authorizing or overriding the verdict
+        for a NavigateToPose goal whose BT already produced its own plan.
+        """
         if self.goal_key is None or plan_stamp <= self.goal_stamp:
             return "ignored"
-        if self.verdict == FAIL:
+        if self.verdict in (FAIL, PASS):
             return "ignored"
         self.plan_stamp = plan_stamp
         self.plan_report = check.as_dict()
@@ -341,6 +354,22 @@ class GateState:
             return False, True
         forward = self.verdict == PASS and self.goal_status in (STATUS_ACCEPTED, STATUS_EXECUTING)
         return forward, False
+
+    def check_freshness(self, costmap_age_s: float | None, status_age_s: float | None) -> bool:
+        """Expire PASS when the costmap or goal-status stream goes stale.
+
+        Called periodically by the ROS node's timer.  Returns True if a
+        transition to FAIL occurred.
+        """
+        if self.verdict != PASS or self.goal_key is None:
+            return False
+        if costmap_age_s is not None and costmap_age_s > COSTMAP_MAX_AGE_S:
+            self._fail([f"costmap stale during forwarding ({costmap_age_s:.1f} s old, limit {COSTMAP_MAX_AGE_S:.0f} s)"])
+            return True
+        if status_age_s is not None and status_age_s > STATUS_MAX_AGE_S:
+            self._fail([f"goal status stale during forwarding ({status_age_s:.1f} s old, limit {STATUS_MAX_AGE_S:.0f} s)"])
+            return True
+        return False
 
     def fail_external(self, reason: str) -> bool:
         if self.goal_key is None or self.verdict == FAIL:
@@ -394,6 +423,7 @@ def main(argv=None) -> int:
             self._log = self._open_log(str(self.get_parameter("log_path").value))
             self._state = GateState()
             self._grid = None
+            self._last_status_time: float | None = None   # monotonic time of last status cb
             self._forwarded = 0
             self._dropped = 0
 
@@ -405,7 +435,7 @@ def main(argv=None) -> int:
             self.create_subscription(Path, "/plan", self._plan_cb, 10)
             self.create_subscription(OccupancyGrid, "/global_costmap/costmap", self._costmap_cb, latched)
             self.create_subscription(GoalStatusArray, "/navigate_to_pose/_action/status", self._status_cb, latched)
-            self.create_timer(1.0, self._publish_report)
+            self.create_timer(1.0, self._freshness_tick)
             self._record("start", {"input": input_topic, "output": output_topic,
                                    "forward_only": self._forward_only})
 
@@ -434,6 +464,15 @@ def main(argv=None) -> int:
             self._report_pub.publish(String(data=json.dumps(
                 {**self._state.report(), "forwarded": self._forwarded, "dropped": self._dropped}, sort_keys=True)))
 
+        def _freshness_tick(self):
+            """Periodic check: expire PASS if costmap or status stream went stale."""
+            now = time.monotonic()
+            costmap_age = (now - self._grid.received) if self._grid is not None else None
+            status_age = (now - self._last_status_time) if self._last_status_time is not None else None
+            if self._state.check_freshness(costmap_age, status_age):
+                self._on_fail()
+            self._publish_report()
+
         # -- failure side effects
         def _on_fail(self):
             self._cancel_pub.publish(Empty())
@@ -445,6 +484,7 @@ def main(argv=None) -> int:
 
         # -- callbacks
         def _status_cb(self, message):
+            self._last_status_time = time.monotonic()
             goals = [(bytes(s.goal_info.goal_id.uuid).hex(), _stamp(s.goal_info.stamp), int(s.status))
                      for s in message.status_list]
             if self._state.on_status(goals):
@@ -472,6 +512,15 @@ def main(argv=None) -> int:
                 self._record("plan_" + outcome, {"plan_stamp_seen": stamp})
 
         def _twist_cb(self, message):
+            # Check costmap/status freshness before forwarding (catch staleness
+            # between timer ticks, especially at controller_server's 10 Hz).
+            now = time.monotonic()
+            costmap_age = (now - self._grid.received) if self._grid is not None else None
+            status_age = (now - self._last_status_time) if self._last_status_time is not None else None
+            if self._state.check_freshness(costmap_age, status_age):
+                self._on_fail()
+                self._dropped += 1
+                return
             forward, newly_failed = self._state.on_twist(float(message.linear.x))
             if forward:
                 self._out.publish(message)
